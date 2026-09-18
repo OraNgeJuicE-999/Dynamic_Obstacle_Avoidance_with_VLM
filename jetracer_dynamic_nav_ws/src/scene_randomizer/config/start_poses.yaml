@@ -1,0 +1,35 @@
+# Fixed candidate start poses for the JetRacer, one hallway.
+#
+# These are NOT randomized per-scene like obstacles/pedestrians — they're a
+# small, hand-picked set meant to cover the range of approaches a real run
+# could start from (e.g. facing straight down the hallway vs. entering from a
+# side doorway vs. starting close to a wall). A scenario picks one of these
+# (car_pose.sample_start_pose) rather than sampling a fresh pose every time,
+# so results stay comparable across scenes/models and every pose eventually
+# gets covered.
+#
+# yaw_deg is measured from the hallway's long axis (0 = facing straight down
+# the hallway). Coordinates match the real Blender-exported hallway geometry:
+# x in [-7.93, 7.93] (length), y in [-1.16, 1.16] (width), see
+# hallway_assets/hallway.json.
+start_poses:
+  - name: center_facing_forward
+    x: -7.0
+    y: 0.0
+    yaw_deg: 0.0
+  - name: near_left_wall
+    x: -7.0
+    y: -0.8
+    yaw_deg: 0.0
+  - name: near_right_wall
+    x: -7.0
+    y: 0.8
+    yaw_deg: 0.0
+  - name: angled_from_side_doorway
+    x: -4.0
+    y: -0.95
+    yaw_deg: 30.0
+  - name: facing_backward
+    x: 7.0
+    y: 0.0
+    yaw_deg: 180.0

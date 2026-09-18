@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scene_randomizer</name>
+  <version>0.0.0</version>
+  <description>
+    Procedural randomization of the Isaac Sim hallway test scene (static obstacle
+    scatter + pedestrian path generation) for the VLM/MLP/world-model path-selection
+    comparison. Exposes ROS2 services to trigger a full scene reroll or a new "take"
+    (same layout, re-rolled pedestrian motion).
+  </description>
+  <maintainer email="itri@todo.todo">itri</maintainer>
+  <license>TODO: License declaration</license>
+
+  <depend>rclpy</depend>
+  <depend>std_srvs</depend>
+  <depend>python3-yaml</depend>
+  <depend>tf_transformations</depend>
+  <depend>jetracer_navigation</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
