@@ -4,6 +4,12 @@ build/
 install/
 log/
 
-# Generated per-run scenario output (scene_randomizer_node's output_dir) —
-# reproducible from a seed, not something to version.
+# Generated per-run scenario output (scene_randomizer_node's output_dir, and
+# the scenes_tester/ test-generation output) — reproducible from a seed,
+# not something to version.
 scenes/
+scenes_tester/
+
+# Assembled training datasets / captured camera frames / model checkpoints —
+# all reproducible from scenes + the training/ pipeline, not source.
+training_data/

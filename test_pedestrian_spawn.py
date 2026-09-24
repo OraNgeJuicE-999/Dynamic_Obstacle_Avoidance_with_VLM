@@ -66,7 +66,11 @@ for _mod_name in list(sys.modules):
 from scene_randomizer.pedestrian_planner import plan_pedestrian_commands, sample_pedestrian_path
 from scene_randomizer.scenario_io import StaticObstacleSpec
 
-HALLWAY_BOUNDS = {"x_min": -7.93, "x_max": 7.93, "y_min": -1.16, "y_max": 1.16}
+# y_min/y_max corrected 2026-09-23 via dense raycast (51 x-positions x 6
+# heights) against real wall collision geometry (was -1.16/1.16, the outer
+# wall reference -- see scene_randomizer_node.py's hallway_bounds param for
+# the full measurement, including why the wall profile isn't flat).
+HALLWAY_BOUNDS = {"x_min": -7.93, "x_max": 7.93, "y_min": -0.98, "y_max": 0.94}
 
 CHARACTER_ASSET_URL = (
     "https://omniverse-content-staging.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/"

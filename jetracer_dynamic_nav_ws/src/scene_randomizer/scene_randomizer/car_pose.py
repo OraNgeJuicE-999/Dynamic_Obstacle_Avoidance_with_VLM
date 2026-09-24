@@ -19,9 +19,13 @@ from tf_transformations import quaternion_from_euler
 
 from scene_randomizer.scenario_io import CarStartPoseSpec
 
-# TODO: verify this against the actual USD stage hierarchy once the JetRacer
-# is loaded in the hallway scene — this is a placeholder, not a confirmed path.
-JETRACER_PRIM_PATH = "/World/jetracer"
+# Verified 2026-09-24 directly against the live hallway stage: /leatherback_ROS
+# (not /World/jetracer, which was never a real prim) is the actual car -- its
+# UsdPhysics.ArticulationRootAPI sits right on this prim, and
+# SingleArticulation("/leatherback_ROS").initialize() successfully reports 26
+# DOF (full suspension + wheel articulation). set_world_pose() was confirmed
+# to actually move it (and restore correctly) in a live test.
+JETRACER_PRIM_PATH = "/leatherback_ROS"
 
 
 def load_start_poses(yaml_path: str) -> List[dict]:
@@ -50,13 +54,19 @@ def sample_start_pose(rng: random.Random, start_poses: List[dict]) -> CarStartPo
 def apply_car_start_pose(pose: CarStartPoseSpec) -> None:
     """Move the JetRacer articulation in Isaac Sim to `pose`.
 
-    NOTE: Articulation's exact API (in particular whether it needs
-    `.initialize()` called first, and the joint-velocity-zeroing calls) varies
-    across Isaac Sim versions — verify against yours.
+    Isaac Sim 6.0's articulation API lives under `isaacsim.core.prims`, not
+    the older `omni.isaac.core.articulations` (which doesn't exist in this
+    install -- confirmed via ModuleNotFoundError). `SingleArticulation` (the
+    singular-prim wrapper, as opposed to the batched `Articulation`) matches
+    this function's one-prim-at-a-time usage and its API
+    (get/set_world_pose, get/set_linear_velocity, etc.) directly, no reshaping
+    needed. `.initialize()` IS required first -- confirmed live: num_dof is 0
+    until then.
     """
-    from omni.isaac.core.articulations import Articulation
+    from isaacsim.core.prims import SingleArticulation
 
-    articulation = Articulation(JETRACER_PRIM_PATH)
+    articulation = SingleArticulation(JETRACER_PRIM_PATH)
+    articulation.initialize()
 
     # tf_transformations returns (x, y, z, w); Isaac Sim wants (w, x, y, z).
     qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, math.radians(pose.yaw_deg))

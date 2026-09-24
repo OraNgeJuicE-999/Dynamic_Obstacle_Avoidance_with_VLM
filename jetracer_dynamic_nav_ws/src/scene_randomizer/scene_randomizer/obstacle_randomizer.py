@@ -12,6 +12,7 @@ Two responsibilities live here, kept separate from the ROS glue:
   2. actually spawning/clearing them on the USD stage (Isaac Sim dependency)
 """
 
+import json
 import random
 from typing import List
 from pathlib import Path
@@ -22,7 +23,7 @@ from tf_transformations import quaternion_from_euler
 from scene_randomizer.scenario_io import StaticObstacleSpec
 
 WALL_CLEARANCE_M = 0.15       # keep obstacles this far from the walls
-MIN_OBSTACLE_SPACING_M = 0.5  # keep obstacles this far from each other
+MIN_OBSTACLE_SPACING_M = 0.5  # keep obstacles this far from each other, ON TOP OF their own footprints
 MIN_PATH_WIDTH_M = 0.6        # never let obstacles close off a corridor narrower than this
 # Keep obstacles this far from both ends of the hallway (along its long/x axis)
 # so the car/pedestrian start poses -- which can be at either end, see
@@ -30,10 +31,33 @@ MIN_PATH_WIDTH_M = 0.6        # never let obstacles close off a corridor narrowe
 # potentially spawning right at the entrance.
 OBSTACLE_START_CLEARANCE_M = 2.0
 
-# StaticObstacleSpec has no real per-asset size yet, so treat every obstacle as
-# a circle of this radius for corridor-width purposes. Revisit once assets
-# carry real dimensions.
+# Fallback used only when a prefab has no <name>.json sidecar (see
+# _asset_footprint_radius) -- real per-asset sizes are used whenever
+# available. This existed as the ONLY radius everywhere until 2026-09-22,
+# when scenes_tester's visualize_scene.py caught pedestrian routes clipping
+# through real obstacle geometry -- real prefabs measured up to ~3x larger
+# than this (e.g. wooden_table's real half-diagonal is ~0.68m). See
+# [[jetracer-nav-pedestrian-bug]].
 OBSTACLE_FOOTPRINT_RADIUS_M = 0.25
+
+
+def _asset_footprint_radius(asset_path: str) -> float:
+    """Real half-diagonal footprint radius for `asset_path`, from its sibling
+    <name>.json sidecar's width_m/depth_m (see hallway_assets/
+    static_obstacles/*.json) -- falls back to OBSTACLE_FOOTPRINT_RADIUS_M if
+    no sidecar exists or it can't be read. Used at PLACEMENT time, before any
+    prim is spawned/measurable. Once an obstacle is actually spawned and its
+    real footprint_min/footprint_max is measured (spawn_static_obstacles),
+    pedestrian_planner._obstacle_effective_radius uses that live measurement
+    instead -- this is the a-priori equivalent for before that exists.
+    """
+    sidecar_path = str(Path(asset_path).with_suffix(".json"))
+    try:
+        with open(sidecar_path) as f:
+            meta = json.load(f)
+        return math.hypot(meta["width_m"] / 2.0, meta["depth_m"] / 2.0)
+    except Exception:
+        return OBSTACLE_FOOTPRINT_RADIUS_M
 
 
 
@@ -69,7 +93,7 @@ def sample_obstacle_positions(
     """
     obj_list = []
     num = 0
-    
+
     while num < num_obstacles:
       xx = rng.uniform(
           hallway_bounds["x_min"] + OBSTACLE_START_CLEARANCE_M,
@@ -77,6 +101,10 @@ def sample_obstacle_positions(
       )
       yy = rng.uniform(hallway_bounds["y_min"] + WALL_CLEARANCE_M, hallway_bounds["y_max"] - WALL_CLEARANCE_M)
       yaw = rng.uniform(-180, 180)
+      # Picked before the checks (not after, like this used to) so the
+      # candidate's own real size can factor into the spacing check below.
+      asset_path = rng.choice(prefab_library)
+      candidate_radius = _asset_footprint_radius(asset_path)
       check = True
 
       # within another obj
@@ -85,7 +113,8 @@ def sample_obstacle_positions(
           x = node.position[0]
           y = node.position[1]
           dist = math.sqrt((xx - x) ** 2 + (yy - y) ** 2)
-          if dist < MIN_OBSTACLE_SPACING_M:
+          min_spacing = candidate_radius + _asset_footprint_radius(node.asset_path) + MIN_OBSTACLE_SPACING_M
+          if dist < min_spacing:
             check = False
 
         # open path with a certain width
@@ -95,7 +124,7 @@ def sample_obstacle_positions(
       if check:
         num += 1
         obstacle = StaticObstacleSpec(
-           asset_path=rng.choice(prefab_library),
+           asset_path=asset_path,
            position=[xx, yy, 0.0],
            yaw_deg=yaw,
         )
@@ -116,19 +145,50 @@ def spawn_static_obstacles(specs: List[StaticObstacleSpec]) -> List[StaticObstac
     `footprint_min`/`footprint_max` with the prim's real measured world-space
     bounding box — this can only happen after the prim is actually on the
     stage and posed, which is why it's not part of sample_obstacle_positions.
+
+    Also applies real PhysX collision to each spawned mesh -- confirmed
+    2026-09-23 that `add_reference_to_stage` on its own gives a purely visual
+    prim with NO collision at all (verified directly: a freshly spawned
+    obstacle let overlap queries pass straight through it everywhere, at
+    every height, until this was added). Without this, the actual
+    car/pedestrian physics bodies could drive/walk straight through a
+    "spawned" obstacle in the live simulation even though the ground-truth
+    occupancy grid correctly marks it as blocked for planning purposes --
+    the grid and the real physics scene would have silently disagreed.
+    Uses convexDecomposition (not convexHull) specifically so real gaps in
+    an asset's shape (e.g. a table's open space between its four legs)
+    survive as real gaps in the physics collision too, not get filled in as
+    one solid convex blob -- see build_lidar_height_occupancy_grid, which
+    depends on this being real per-shape collision, not an approximation
+    that erases the exact detail it's trying to capture.
     """
     from isaacsim.core.prims import XFormPrim
     from isaacsim.core.utils.stage import add_reference_to_stage
     import omni.usd
-    from pxr import Usd, UsdGeom
+    from pxr import Usd, UsdGeom, UsdPhysics
 
     stage = omni.usd.get_context().get_stage()
-    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_], useExtentsHint=True)
+    # useExtentsHint=False, NOT True: an authored extentsHint on an asset can
+    # be stale/wrong and get read instead of the live posed geometry -- this
+    # exact failure mode was confirmed 2026-09-22 for the "cabnit" prefab,
+    # whose useExtentsHint=True-measured Y-footprint (1.41m) turned out to
+    # exactly match its HEIGHT (1.41m per its sidecar .json), not its real
+    # ~0.64m depth. Same root cause as the hallway geometry's own bbox issues
+    # documented in [[jetracer-nav-isaac-gotchas]] -- always compute real
+    # geometry, don't trust an asset's extentsHint.
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_], useExtentsHint=False)
 
     for i, spec in enumerate(specs):
         prim_path = f"/World/hallway_obstacles/obstacle_{i}"
 
         add_reference_to_stage(usd_path=spec.asset_path, prim_path=prim_path)
+
+        for mesh_prim in Usd.PrimRange(stage.GetPrimAtPath(prim_path)):
+            if not mesh_prim.IsA(UsdGeom.Mesh):
+                continue
+            UsdPhysics.CollisionAPI.Apply(mesh_prim)
+            mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(mesh_prim)
+            mesh_collision.CreateApproximationAttr("convexDecomposition")
 
         # tf_transformations returns (x, y, z, w); Isaac Sim's XFormPrim wants
         # (w, x, y, z) — reorder, don't pass it straight through.
@@ -208,6 +268,94 @@ def build_ground_truth_occupancy_grid(
     return grid, _MapInfo(x_min, y_min, resolution)
 
 
+# The real, live-measured height of the JetRacer's lidar sensor -- read from
+# /leatherback_ROS/Rigid_Bodies/Chassis/Lidar_01's world position on the
+# actual project stage, 2026-09-23. This is the real robot in use; an
+# earlier estimate (~0.1225m) came from jetracer.urdf/jetracer.xacro at the
+# repo root, which describe a DIFFERENT, unused robot model -- don't revive
+# that number.
+LIDAR_HEIGHT_M = 0.2850431556549647
+
+
+def build_lidar_height_occupancy_grid(
+    hallway_bounds: dict,
+    obstacles: List[StaticObstacleSpec],
+    lidar_height: float = LIDAR_HEIGHT_M,
+    resolution: float = 0.05,
+    scan_margin_m: float = 0.1,
+):
+    """Binary occupancy grid (same format/convention as
+    build_ground_truth_occupancy_grid) representing what's ACTUALLY solid at
+    `lidar_height`, not each obstacle's full top-to-bottom bounding box
+    collapsed straight down. A table's open space between its four legs
+    reads as free here, even though build_ground_truth_occupancy_grid marks
+    its whole footprint as blocked -- the two grids answer different
+    questions ("could anything about this obstacle possibly matter" vs.
+    "does the lidar's own view actually see something blocking here").
+
+    Requires each obstacle to already have REAL PhysX collision applied
+    (spawn_static_obstacles does this) -- confirmed 2026-09-23 that a purely
+    visual mesh with no collision reads as free everywhere, at every height,
+    which would silently produce an all-clear grid instead of an error.
+
+    Only scans within each obstacle's own measured footprint (padded by
+    `scan_margin_m`), not the whole hallway -- open floor away from any
+    obstacle is already known free without needing a physics query there,
+    and scanning only ~14,900 cells' worth of open hallway floor for no
+    reason would be needlessly slow. Uses
+    omni.physx.get_physx_scene_query_interface().overlap_box_any -- Isaac
+    Sim only, requires a live stage with Play active.
+    """
+    import carb
+    import omni.physx
+
+    x_min, x_max = hallway_bounds["x_min"], hallway_bounds["x_max"]
+    y_min, y_max = hallway_bounds["y_min"], hallway_bounds["y_max"]
+    width = int(math.ceil((x_max - x_min) / resolution)) + 1
+    height = int(math.ceil((y_max - y_min) / resolution)) + 1
+    grid = np.zeros((height, width), dtype=np.uint8)
+
+    iface = omni.physx.get_physx_scene_query_interface()
+    half_extent = carb.Float3(resolution / 2, resolution / 2, 0.02)
+    rot = carb.Float4(0, 0, 0, 1)
+
+    for obstacle in obstacles:
+        if obstacle.footprint_min is None or obstacle.footprint_max is None:
+            continue
+        ox_lo = obstacle.footprint_min[0] - scan_margin_m
+        oy_lo = obstacle.footprint_min[1] - scan_margin_m
+        ox_hi = obstacle.footprint_max[0] + scan_margin_m
+        oy_hi = obstacle.footprint_max[1] + scan_margin_m
+
+        px_lo = max(0, int(math.floor((ox_lo - x_min) / resolution)))
+        px_hi = min(width, int(math.ceil((ox_hi - x_min) / resolution)) + 1)
+        py_lo = max(0, int(math.floor((oy_lo - y_min) / resolution)))
+        py_hi = min(height, int(math.ceil((oy_hi - y_min) / resolution)) + 1)
+
+        for py in range(py_lo, py_hi):
+            wy = y_min + py * resolution
+            for px in range(px_lo, px_hi):
+                wx = x_min + px * resolution
+                if iface.overlap_box_any(half_extent, carb.Float3(wx, wy, lidar_height), rot):
+                    grid[py, px] = 1
+
+    class _Position:
+        def __init__(self, x, y):
+            self.x = x
+            self.y = y
+
+    class _Origin:
+        def __init__(self, x, y):
+            self.position = _Position(x, y)
+
+    class _MapInfo:
+        def __init__(self, origin_x, origin_y, resolution):
+            self.origin = _Origin(origin_x, origin_y)
+            self.resolution = resolution
+
+    return grid, _MapInfo(x_min, y_min, resolution)
+
+
 def clear_static_obstacles(specs: List[StaticObstacleSpec]) -> None:
     """Remove previously spawned obstacle prims from the stage.
 
@@ -225,10 +373,12 @@ def clear_static_obstacles(specs: List[StaticObstacleSpec]) -> None:
 def _min_corridor_width_at(x: float, placed: List[StaticObstacleSpec], hallway_bounds: dict) -> float:
     """Widest clear gap across the hallway's y-extent at hallway position `x`.
 
-    Obstacles are approximated as circles of radius OBSTACLE_FOOTPRINT_RADIUS_M
-    (see that constant's comment for why). Only obstacles whose x-position is
-    within one footprint radius of `x` can block the corridor at this x-slice —
-    everything else is too far away along the hallway to matter here.
+    Each obstacle is approximated as a circle of its own real footprint
+    radius (see _asset_footprint_radius) -- was a single fixed
+    OBSTACLE_FOOTPRINT_RADIUS_M for every obstacle regardless of real size
+    until 2026-09-22. Only obstacles whose x-position is within one footprint
+    radius of `x` can block the corridor at this x-slice — everything else is
+    too far away along the hallway to matter here.
     """
     y_min = hallway_bounds["y_min"]
     y_max = hallway_bounds["y_max"]
@@ -236,10 +386,11 @@ def _min_corridor_width_at(x: float, placed: List[StaticObstacleSpec], hallway_b
     blocked_intervals = []
     for obstacle in placed:
         ox, oy = obstacle.position[0], obstacle.position[1]
-        if abs(ox - x) > OBSTACLE_FOOTPRINT_RADIUS_M:
+        radius = _asset_footprint_radius(obstacle.asset_path)
+        if abs(ox - x) > radius:
             continue
-        lo = max(y_min, oy - OBSTACLE_FOOTPRINT_RADIUS_M)
-        hi = min(y_max, oy + OBSTACLE_FOOTPRINT_RADIUS_M)
+        lo = max(y_min, oy - radius)
+        hi = min(y_max, oy + radius)
         blocked_intervals.append((lo, hi))
 
     if not blocked_intervals:

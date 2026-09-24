@@ -33,6 +33,7 @@ from std_srvs.srv import Trigger
 from scene_randomizer.car_pose import apply_car_start_pose, load_start_poses, sample_start_pose
 from scene_randomizer.obstacle_randomizer import (
     build_ground_truth_occupancy_grid,
+    build_lidar_height_occupancy_grid,
     clear_static_obstacles,
     load_obstacle_prefab_library,
     sample_obstacle_positions,
@@ -43,7 +44,7 @@ from scene_randomizer.pedestrian_randomizer import (
     sample_pedestrian_paths,
     spawn_pedestrians,
 )
-from scene_randomizer.scenario_io import Scenario, new_seed, save_scenario
+from scene_randomizer.scenario_io import Scenario, new_seed, save_pedestrian_trajectories, save_scenario
 
 
 class SceneRandomizerNode(Node):
@@ -56,9 +57,24 @@ class SceneRandomizerNode(Node):
       self.declare_parameter('assets_dir', '/home/itri/jetracer_nav/hallway_assets/static_obstacles')
       self.declare_parameter('output_dir', '/home/itri/jetracer_nav/scenes')
       self.declare_parameter('start_poses_yaml', '')
+      # y_min/y_max corrected 2026-09-23 via direct raycast against the real
+      # wall collision geometry (was -1.16/1.16, the *outer* wall reference --
+      # objects/pedestrians could be placed up to ~17cm INTO the actual wall).
+      # A first pass (5 x-samples, 1 height) found 0.988/-1.026, but a much
+      # denser follow-up scan (51 x-positions x 6 heights, 0.05m-1.2m off the
+      # floor) found the TRUE worst case tighter still: y=0.9758 (near-floor,
+      # x=-6.6 -- likely a baseboard/kickplate) and y=-1.0137 (higher up,
+      # x=-5.1, a different height than the +Y tightest point -- the wall
+      # profile is NOT a simple flat vertical surface). 0.94/-0.98 leaves
+      # ~3.5cm margin below that measured worst case on both sides.
+      # x_max=7.93 was already correct (real wall measured at 7.933). x_min
+      # has NO measurable wall at all -- raycasts found nothing within 5m even
+      # from x=-6 -- the -X end is a genuinely open doorway/architectural
+      # transition, not a solid wall, so it's left as the existing authored
+      # value rather than "corrected" against something that doesn't exist.
       self.declare_parameter(
           'hallway_bounds',
-          [-7.93, 7.93, -1.16, 1.16],  # x_min, x_max, y_min, y_max
+          [-7.93, 7.93, -0.98, 0.94],  # x_min, x_max, y_min, y_max
       )
       self.declare_parameter('character_pool', [''])
 
@@ -73,13 +89,16 @@ class SceneRandomizerNode(Node):
       self._prefab_library = []
       self._start_poses = []
 
-      # Continue numbering from existing scene_NN.json files rather than
-      # overwriting scene_01 every time this node restarts.
+      # Continue numbering from existing scene_NN/ subfolders rather than
+      # overwriting scene_01 every time this node restarts. Each scene gets
+      # its own subfolder (scenario.json, ground_truth.npy/.json,
+      # trajectory.json, and a scene.usd snapshot) rather than flat
+      # scene_NN_*.* files, so everything about one scene lives together.
       self._scene_index = 0
       if os.path.isdir(self.output_dir):
           for name in os.listdir(self.output_dir):
-              match = re.fullmatch(r"scene_(\d+)\.json", name)
-              if match:
+              match = re.fullmatch(r"scene_(\d+)", name)
+              if match and os.path.isdir(os.path.join(self.output_dir, name)):
                   self._scene_index = max(self._scene_index, int(match.group(1)))
 
       self.create_service(Trigger, 'regenerate_scene', self._on_regenerate_scene)
@@ -91,14 +110,22 @@ class SceneRandomizerNode(Node):
       x_min, x_max, y_min, y_max = self.get_parameter('hallway_bounds').value
       return {'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max}
 
+    def _scene_dir(self, scene_index: int) -> str:
+      """Per-scene subfolder -- everything about one scene (scenario.json,
+      ground_truth.npy/.json, trajectory.json, scene.usd) lives together here
+      rather than as flat scene_NN_*.* files in self.output_dir."""
+      path = os.path.join(self.output_dir, f"scene_{scene_index:02d}")
+      os.makedirs(path, exist_ok=True)
+      return path
+
     def _save_ground_truth_grid(self, obstacles, scene_index: int) -> None:
-      """Save the real-footprint obstacle occupancy grid alongside scene_<idx>.json.
+      """Save the real-footprint obstacle occupancy grid into this scene's subfolder.
 
       Runs automatically on every full regeneration — obstacles must already be
       spawned (spawn_static_obstacles measures each one's real bounding box).
       """
       grid, map_info = build_ground_truth_occupancy_grid(self._hallway_bounds(), obstacles)
-      base_path = os.path.join(self.output_dir, f"scene_{scene_index:02d}_ground_truth")
+      base_path = os.path.join(self._scene_dir(scene_index), "ground_truth")
       np.save(f"{base_path}.npy", grid)
       with open(f"{base_path}.json", 'w') as f:
           json.dump({
@@ -108,6 +135,57 @@ class SceneRandomizerNode(Node):
               'width': int(grid.shape[1]),
               'height': int(grid.shape[0]),
           }, f, indent=2)
+
+    def _save_lidar_height_grid(self, obstacles, scene_index: int) -> None:
+      """Save the lidar-height-sliced occupancy grid into this scene's
+      subfolder, alongside (not instead of) the full-bbox ground_truth grid
+      -- the two answer different questions (see
+      build_lidar_height_occupancy_grid's docstring): this one correctly
+      shows the real open space under e.g. a table, between its legs, which
+      ground_truth.npy marks fully blocked. Requires obstacles to already
+      have real PhysX collision (spawn_static_obstacles applies it) and
+      Play to be active.
+      """
+      grid, map_info = build_lidar_height_occupancy_grid(self._hallway_bounds(), obstacles)
+      base_path = os.path.join(self._scene_dir(scene_index), "lidar_height_ground_truth")
+      np.save(f"{base_path}.npy", grid)
+      with open(f"{base_path}.json", 'w') as f:
+          json.dump({
+              'resolution': map_info.resolution,
+              'origin_x': map_info.origin.position.x,
+              'origin_y': map_info.origin.position.y,
+              'width': int(grid.shape[1]),
+              'height': int(grid.shape[0]),
+          }, f, indent=2)
+
+    def _save_trajectories(self, pedestrians, scene_index: int) -> None:
+      """Save each pedestrian's actual walked path over time into this scene's
+      subfolder -- pedestrians must already be driven (spawn_pedestrians
+      populates spec.trajectory as it drives them)."""
+      output_path = os.path.join(self._scene_dir(scene_index), "trajectory.json")
+      save_pedestrian_trajectories(pedestrians, scene_index, output_path)
+
+    def _save_scene_usd(self, scene_dir: str) -> None:
+      """Export the live stage's root layer as scene.usd in this scene's
+      subfolder -- a self-contained, reopenable copy of hallway_scene.usd
+      showing exactly this scene's obstacle + pedestrian layout (at their
+      final resting position, since this runs after spawn_pedestrians
+      finishes driving them -- the walk itself isn't baked into USD state,
+      see trajectory.json for that).
+
+      Deliberately uses Usd.Stage.GetRootLayer().Export(...), NOT
+      omni.usd's save_as_stage() -- the latter would make the newly-saved
+      copy the new "currently open" stage going forward, silently diverging
+      every later regeneration away from the master hallway_scene.usd.
+      Export() just writes a copy without touching what's open. Best-effort:
+      doesn't fail scene generation if the export itself has trouble.
+      """
+      import omni.usd
+      try:
+          stage = omni.usd.get_context().get_stage()
+          stage.GetRootLayer().Export(os.path.join(scene_dir, "scene.usd"))
+      except Exception as exc:
+          self.get_logger().warn(f"Failed to export scene.usd snapshot to {scene_dir}: {exc}")
 
     def _on_regenerate_scene(self, request, response):
       """Full reroll: new seed, new statics, new pedestrians."""
@@ -139,9 +217,12 @@ class SceneRandomizerNode(Node):
               car_start_pose=pose,
           )
           self._scene_index += 1
-          output_path = os.path.join(self.output_dir, f"scene_{self._scene_index:02d}.json")
-          save_scenario(self._current_scenario, output_path)
+          scene_dir = self._scene_dir(self._scene_index)
+          save_scenario(self._current_scenario, os.path.join(scene_dir, "scenario.json"))
           self._save_ground_truth_grid(ob, self._scene_index)
+          self._save_lidar_height_grid(ob, self._scene_index)
+          self._save_trajectories(ped, self._scene_index)
+          self._save_scene_usd(scene_dir)
 
           response.success = True
           response.message = f"Regenerated scene with seed {seed}"
@@ -165,8 +246,16 @@ class SceneRandomizerNode(Node):
                 pedestrians, self._hallway_bounds(), obstacles=self._current_scenario.static_obstacles)
 
             self._scene_index += 1
-            output_path = os.path.join(self.output_dir, f"scene_{self._scene_index:02d}.json")
-            save_scenario(self._current_scenario, output_path)
+            scene_dir = self._scene_dir(self._scene_index)
+            save_scenario(self._current_scenario, os.path.join(scene_dir, "scenario.json"))
+            # Static layout is unchanged from the previous take, but each
+            # scene_NN/ subfolder should be self-contained -- re-write the
+            # (identical) ground truth grid here too rather than only in the
+            # earlier scene's folder.
+            self._save_ground_truth_grid(self._current_scenario.static_obstacles, self._scene_index)
+            self._save_lidar_height_grid(self._current_scenario.static_obstacles, self._scene_index)
+            self._save_trajectories(self._current_scenario.pedestrians, self._scene_index)
+            self._save_scene_usd(scene_dir)
 
             response.success = True
             response.message = "New take: respawned pedestrians."

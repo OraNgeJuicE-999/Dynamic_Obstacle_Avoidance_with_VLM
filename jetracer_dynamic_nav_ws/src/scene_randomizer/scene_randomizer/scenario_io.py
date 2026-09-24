@@ -50,6 +50,16 @@ class PedestrianPathSpec:
     turn_event: Optional[dict] = None   # e.g. {"at_fraction": 0.5, "new_heading": "diagonal_left"}
     stop_event: Optional[dict] = None   # e.g. {"at_fraction": 0.6, "duration_s": 3.0}
     character_id: Optional[str] = None  # filled in once spawned
+    prim_path: Optional[str] = None     # USD prim path, filled in once spawned (see StaticObstacleSpec)
+    # Actual walked path over time, filled in once driven -- one dict per
+    # sample: {"t": seconds since this pedestrian's route started, "x", "y",
+    # "yaw" (RADIANS -- matches training.common.trajectory_io.TrajectorySample's
+    # convention; this was "yaw_deg" until 2026-09-23, which silently broke
+    # loading as degrees-read-as-radians). This is what gets converted into
+    # a training.common.trajectory_io.SceneTrajectories and written to
+    # trajectory.json for dataset_builder.py -- see
+    # save_pedestrian_trajectories and pedestrian_randomizer._drive_concurrently.
+    trajectory: Optional[List[dict]] = None
 
 @dataclass
 class CarStartPoseSpec:
@@ -87,6 +97,41 @@ def save_scenario(scenario: Scenario, output_path: str) -> None:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         json.dump(asdict(scenario), f, indent=2)
+
+
+def save_pedestrian_trajectories(pedestrians: List[PedestrianPathSpec], scene_index: int, output_path: str) -> None:
+    """Write each pedestrian's actual walked path over time to `output_path`
+    as a training.common.trajectory_io.SceneTrajectories JSON -- what
+    dataset_builder.py's load_trajectories() reads for oracle_scorer's "is
+    the car near the pedestrian at time t" checks. Call this only after the
+    pedestrians have actually been driven (spec.trajectory populated by
+    pedestrian_randomizer.spawn_pedestrians), alongside save_scenario and
+    obstacle_randomizer.build_ground_truth_occupancy_grid's outputs for the
+    same scene.
+
+    Deliberately imports and reuses training's own schema/save function
+    (added 2026-09-23) rather than writing a similar-but-not-identical shape
+    from scratch -- the whole reason there was a mismatch before
+    ({"pedestrians": [{"character_id", "asset_id", "trajectory"}]} vs. the
+    real SceneTrajectories{scene_index, actors: [{actor_id, samples}]}) was
+    two independently-hand-rolled schemas drifting apart. `training/` has no
+    Isaac Sim/ROS2 dependency of its own (pure dataclasses + json), so this
+    import is safe from this package.
+    """
+    import sys
+    _repo_root = "/home/itri/jetracer_nav"
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from training.common.trajectory_io import ActorTrajectory, SceneTrajectories, TrajectorySample, save_trajectories
+
+    actors = [
+        ActorTrajectory(
+            actor_id=ped.character_id,
+            samples=[TrajectorySample(t=s["t"], x=s["x"], y=s["y"], yaw=s["yaw"]) for s in (ped.trajectory or [])],
+        )
+        for ped in pedestrians
+    ]
+    save_trajectories(SceneTrajectories(scene_index=scene_index, actors=actors), output_path)
 
 
 def load_scenario(input_path: str) -> Scenario:

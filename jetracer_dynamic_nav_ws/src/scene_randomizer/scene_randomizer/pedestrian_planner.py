@@ -37,8 +37,36 @@ MIN_PEDESTRIAN_START_SPACING_M = 0.5  # keep pedestrian start points from spawni
 PEDESTRIAN_START_CLEARANCE_M = 1.0
 
 GRID_RESOLUTION_M = 0.05       # occupancy grid cell size for A* routing
-PEDESTRIAN_BODY_RADIUS_M = 0.25  # inflation radius, matches obstacle footprint scale
+# Inflation radius for both the A* grid (plan_path) and the extra margin
+# added on top of each obstacle's own real footprint (plan_pedestrian_commands'
+# obstacle_clearance). Bumped from 0.25m 2026-09-23 -- a pedestrian was
+# observed ending up overlapping an obstacle (a printer) at runtime, likely
+# a behavior-agent local-avoidance wobble that the original margin didn't
+# leave enough room to absorb. 0.35m is still a realistic human-body-plus-sway
+# radius, not an unreasonably large planning margin.
+PEDESTRIAN_BODY_RADIUS_M = 0.35
 GOAL_THRESHOLD_M = 0.15
+
+# Pedestrians route within a region inset this far from hallway_bounds on
+# every side -- on top of PEDESTRIAN_WALL_CLEARANCE_M's own start-position
+# inset, which only affects where a pedestrian is first placed, not the
+# whole region an A*-planned path is free to pass through. Without this, a
+# planned route can graze right up against the raw hallway_bounds edge,
+# which is itself only a few cm of margin below the *measured* real wall
+# (see scene_randomizer_node.py's hallway_bounds param) -- combined with a
+# behavior agent's own runtime local-avoidance wobble, that was tight enough
+# to leave a pedestrian stuck oscillating against a wall/obstacle. Added
+# 2026-09-23. See [[jetracer-nav-pedestrian-bug]].
+PEDESTRIAN_BOUNDS_INSET_M = 0.15
+
+
+def _pedestrian_bounds(hallway_bounds: dict) -> dict:
+    return {
+        "x_min": hallway_bounds["x_min"] + PEDESTRIAN_BOUNDS_INSET_M,
+        "x_max": hallway_bounds["x_max"] - PEDESTRIAN_BOUNDS_INSET_M,
+        "y_min": hallway_bounds["y_min"] + PEDESTRIAN_BOUNDS_INSET_M,
+        "y_max": hallway_bounds["y_max"] - PEDESTRIAN_BOUNDS_INSET_M,
+    }
 
 
 def sample_pedestrian_path(
@@ -47,6 +75,7 @@ def sample_pedestrian_path(
     character_id: str,
 ) -> PedestrianPathSpec:
     """Sample one pedestrian's start point, heading, speed, and optional event."""
+    hallway_bounds = _pedestrian_bounds(hallway_bounds)
     heading = rng.choice(HEADINGS)
     speed = rng.uniform(MIN_SPEED_MPS, MAX_SPEED_MPS)
     event = rng.choice(("turn", "stop"))
@@ -176,10 +205,35 @@ def build_occupancy_grid(
     grid = np.zeros((height, width), dtype=np.uint8)
     map_info = _MapInfo(x_min, y_min, resolution)
 
-    radius_px = int(round(OBSTACLE_FOOTPRINT_RADIUS_M / resolution))
     for obstacle in obstacles:
-        center = world_to_pixel(obstacle.position[0], obstacle.position[1], map_info)
-        _stamp_circle(grid, center.x, center.y, radius_px)
+        fmin, fmax = obstacle.footprint_min, obstacle.footprint_max
+        if fmin is not None and fmax is not None:
+            # Stamp the real measured rectangle directly -- matches the
+            # pattern obstacle_randomizer.build_ground_truth_occupancy_grid
+            # already uses. A circular approximation (this code's original
+            # approach, and briefly a half-diagonal-radius circle on
+            # 2026-09-22) over-inflates elongated obstacles hugely on their
+            # short axis -- a 1.17x0.52m desk's half-diagonal is 0.64m, but
+            # its real short-axis half-width is only 0.26m, so a circular
+            # stamp claimed 2.5x more clearance than the real object needs on
+            # that side. That over-inflation was severe enough to make most
+            # pedestrian routes in a 2.32m-wide hallway fail to plan at all.
+            # See [[jetracer-nav-pedestrian-bug]].
+            px_lo = int(math.floor((fmin[0] - x_min) / resolution))
+            px_hi = int(math.ceil((fmax[0] - x_min) / resolution))
+            py_lo = int(math.floor((fmin[1] - y_min) / resolution))
+            py_hi = int(math.ceil((fmax[1] - y_min) / resolution))
+            px_lo, px_hi = max(0, px_lo), min(width, px_hi + 1)
+            py_lo, py_hi = max(0, py_lo), min(height, py_hi + 1)
+            grid[py_lo:py_hi, px_lo:px_hi] = 1
+        else:
+            # No real footprint known (e.g. a StaticObstacleSpec built from a
+            # live-stage position read with no bbox measured -- see
+            # test_pedestrian_spawn.py's read_live_obstacles) -- fall back to
+            # a uniform circular approximation.
+            center = world_to_pixel(obstacle.position[0], obstacle.position[1], map_info)
+            radius_px = int(round(OBSTACLE_FOOTPRINT_RADIUS_M / resolution))
+            _stamp_circle(grid, center.x, center.y, radius_px)
 
     return grid, map_info
 
@@ -290,37 +344,76 @@ def _index_at_fraction(waypoints: List[Tuple[float, float]], fraction: float) ->
     return len(waypoints) - 1
 
 
+def _push_clear_of_one_obstacle(
+    x: float, y: float, obstacle: StaticObstacleSpec, margin: float,
+) -> Tuple[float, float, bool]:
+    """If (x, y) is within `margin` of `obstacle`'s real footprint rectangle
+    (or, lacking real footprint data, within margin + OBSTACLE_FOOTPRINT_RADIUS_M
+    of its center), push it to just outside that margin and return
+    (new_x, new_y, True); otherwise return the point unchanged with False.
+
+    Pushes to the real rectangle's nearest edge, not radially from the
+    obstacle's center circle -- a circular approximation (even one sized
+    from the real footprint's half-diagonal, tried briefly on 2026-09-22)
+    over-inflates elongated obstacles on their short axis badly enough to
+    make most routes in a 2.32m-wide hallway fail to plan. See
+    [[jetracer-nav-pedestrian-bug]].
+    """
+    fmin, fmax = obstacle.footprint_min, obstacle.footprint_max
+    if fmin is None or fmax is None:
+        ox, oy = obstacle.position[0], obstacle.position[1]
+        dx, dy = x - ox, y - oy
+        dist = math.hypot(dx, dy)
+        min_clearance = OBSTACLE_FOOTPRINT_RADIUS_M + margin
+        if dist >= min_clearance:
+            return x, y, False
+        if dist < 1e-9:
+            dx, dy, dist = 1.0, 0.0, 1.0
+        scale = min_clearance / dist
+        return ox + dx * scale, oy + dy * scale, True
+
+    lo_x, lo_y = fmin[0] - margin, fmin[1] - margin
+    hi_x, hi_y = fmax[0] + margin, fmax[1] + margin
+    if not (lo_x <= x <= hi_x and lo_y <= y <= hi_y):
+        return x, y, False
+    # Inside the margin-expanded rectangle -- push out through the nearest edge.
+    d_left, d_right = x - lo_x, hi_x - x
+    d_bottom, d_top = y - lo_y, hi_y - y
+    closest = min(d_left, d_right, d_bottom, d_top)
+    if closest == d_left:
+        return lo_x, y, True
+    if closest == d_right:
+        return hi_x, y, True
+    if closest == d_bottom:
+        return x, lo_y, True
+    return x, hi_y, True
+
+
 def _clear_of_obstacles(
     point: Tuple[float, float],
     obstacles: List[StaticObstacleSpec],
-    min_clearance: float,
+    pedestrian_margin: float,
     passes: int = 3,
 ) -> Tuple[float, float]:
-    """Push `point` directly away from any obstacle center it's within
-    `min_clearance` of.
+    """Push `point` clear of every obstacle it's within `pedestrian_margin`
+    of, using each obstacle's real measured footprint rectangle (or a
+    fallback circle -- see _push_clear_of_one_obstacle).
 
     Needed because start/turn/goal points are picked purely from hallway
     geometry (walk straight to the wall), with no awareness of obstacles —
     plan_path's own inflation forcibly frees the exact start/goal pixel
     regardless of surroundings (see build_occupancy_grid's docstring), so a
-    point picked inside an obstacle's inflated radius becomes an isolated
+    point picked inside an obstacle's inflated footprint becomes an isolated
     free pixel with no reachable neighbors instead of a normal collision
     rejection. Repeated a few passes since pushing clear of one obstacle can
-    move a point into another's radius.
+    move a point into another's margin.
     """
     x, y = point
     for _ in range(passes):
         moved = False
         for obstacle in obstacles:
-            ox, oy = obstacle.position[0], obstacle.position[1]
-            dx, dy = x - ox, y - oy
-            dist = math.hypot(dx, dy)
-            if dist < min_clearance:
-                if dist < 1e-9:
-                    dx, dy, dist = 1.0, 0.0, 1.0
-                scale = min_clearance / dist
-                x, y = ox + dx * scale, oy + dy * scale
-                moved = True
+            x, y, did_move = _push_clear_of_one_obstacle(x, y, obstacle, pedestrian_margin)
+            moved = moved or did_move
         if not moved:
             break
     return (x, y)
@@ -339,8 +432,12 @@ def plan_pedestrian_commands(
     of assuming a clear straight line — so a pedestrian whose designed
     trajectory would clip through a chair or desk detours around it instead.
     """
+    hallway_bounds = _pedestrian_bounds(hallway_bounds)
     grid, map_info = build_occupancy_grid(hallway_bounds, obstacles, resolution)
-    obstacle_clearance = OBSTACLE_FOOTPRINT_RADIUS_M + PEDESTRIAN_BODY_RADIUS_M + resolution
+    # Per-obstacle real footprint radius is now added inside _clear_of_obstacles
+    # itself (see _obstacle_effective_radius) -- this is just the pedestrian's
+    # own body margin on top of that.
+    obstacle_clearance = PEDESTRIAN_BODY_RADIUS_M + resolution
 
     sx, sy, _ = spec.start_position
     start_xy = _clear_of_obstacles((sx, sy), obstacles, obstacle_clearance)
